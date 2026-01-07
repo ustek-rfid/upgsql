@@ -6,27 +6,99 @@ Advanced CLI tool for backing up, restoring, and synchronizing PostgreSQL databa
 
 ## Features
 
+### Core Operations
 - **Dump**: Backup from local or remote database
 - **Restore**: Restore backup to local or remote database
 - **Clone**: Single command dump + restore (full sync)
 - **Fetch**: Download existing dump from remote server
-- **Batch**: Run multiple jobs sequentially
-- **Metadata**: Store timing, source, and target info with each backup
-- **SSH Support**: Access remote servers via SSH tunnel
-- **Password Security**: Read passwords from files or environment variables
+- **Streaming**: Direct pipe clone without temp files (`--stream`)
+
+### Batch & Automation
+- **Batch Jobs**: Run multiple jobs from `jobs.yaml`
+- **Parallel Execution**: Run jobs concurrently (`--parallel N`)
+- **Job Filtering**: Run specific jobs (`--only`) or skip jobs (`--exclude`)
+- **Notifications**: Telegram, Slack, Webhook, Email with summary support
+
+### Data Management
+- **Data Masking**: Anonymize sensitive data after restore (`--mask`)
+- **Table Filtering**: Include/exclude tables or schemas
+- **GFS Retention**: Grandfather-Father-Son backup rotation policy
+
+### Security & Reliability
+- **Health Checks**: Verify connections before operations
+- **SSH Tunnel**: Secure access to remote databases
+- **Password Security**: Read from files or environment variables
+- **Metadata**: Track timing, source, and operation details
 
 ## Installation
+
+### Quick Install (Recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Asimatasert/t-pgsql/master/install.sh | bash
+```
+
+### Homebrew (macOS/Linux)
+
+```bash
+brew tap Asimatasert/t-pgsql
+brew install t-pgsql
+```
+
+### Debian/Ubuntu
+
+```bash
+# Download latest .deb package
+curl -LO https://github.com/Asimatasert/t-pgsql/releases/latest/download/t-pgsql_latest_all.deb
+sudo dpkg -i t-pgsql_latest_all.deb
+```
+
+### Arch Linux (AUR)
+
+```bash
+# Using yay
+yay -S t-pgsql
+
+# Or manually
+git clone https://github.com/Asimatasert/t-pgsql.git
+cd t-pgsql/arch
+makepkg -si
+```
+
+### Manual Installation
 
 ```bash
 # Clone the repository
 git clone https://github.com/Asimatasert/t-pgsql
 cd t-pgsql
 
-# Make executable
-chmod +x t-pgsql
+# Install with make
+sudo make install
 
-# Add to PATH (optional)
+# Or manual install
+chmod +x t-pgsql
 sudo ln -s $(pwd)/t-pgsql /usr/local/bin/t-pgsql
+```
+
+### Shell Completions
+
+Completions are installed automatically with package managers. For manual setup:
+
+```bash
+# Zsh
+cp completions/_t-pgsql ~/.zsh/completions/
+
+# Bash
+cp completions/t-pgsql.bash /etc/bash_completion.d/t-pgsql
+
+# Fish
+cp completions/t-pgsql.fish ~/.config/fish/completions/
+```
+
+### Man Page
+
+```bash
+man t-pgsql
 ```
 
 ### Requirements
@@ -34,6 +106,7 @@ sudo ln -s $(pwd)/t-pgsql /usr/local/bin/t-pgsql
 - PostgreSQL client (`pg_dump`, `pg_restore`, `psql`)
 - SSH client (for remote operations)
 - Bash 4.0+
+- Optional: `pv` (for streaming buffer)
 
 ## Quick Start
 
@@ -217,6 +290,23 @@ Performs dump + restore in a single command.
   --from-password-file .secrets/prod.pass \
   --to-password-file .secrets/local.pass \
   --force
+
+# Streaming clone (no temp files, direct pipe)
+./t-pgsql clone \
+  --from "ssh://user@prod/postgres@localhost/app" \
+  --to "postgres@localhost/dev" \
+  --from-password-file .secrets/prod.pass \
+  --to-password-file .secrets/local.pass \
+  --stream \
+  --force
+
+# Streaming with custom buffer size
+./t-pgsql clone \
+  --from "postgres@localhost/prod" \
+  --to "postgres@localhost/dev" \
+  --stream \
+  --stream-buffer 128 \
+  --force
 ```
 
 ---
@@ -354,13 +444,37 @@ Save any command with `--save <name>`:
 
 ```bash
 # Run a single job
-./t-pgsql --batch rftt_sync
+./t-pgsql batch rftt_sync
 
 # Run all jobs sequentially
-./t-pgsql --batch all
+./t-pgsql batch all
 
-# Continue on error
-./t-pgsql --batch all --continue-on-error
+# Use different YAML file
+./t-pgsql batch all --yaml sync-30     # Uses ~/bin/sync-30.yaml
+./t-pgsql batch all --yaml /path/to/custom.yaml
+
+# Run jobs in parallel (3 concurrent jobs)
+./t-pgsql batch all --parallel 3
+
+# Parallel with error handling
+./t-pgsql batch all --parallel 4 --continue-on-error
+
+# Run only specific jobs
+./t-pgsql batch all --only "job1,job2,job3"
+
+# Exclude specific jobs
+./t-pgsql batch all --exclude "slow_job,optional_job"
+
+# Send summary notification after batch
+./t-pgsql batch all --notify telegram:TOKEN:CHAT --notify-summary
+
+# Combined: parallel with filtering and notifications
+./t-pgsql batch all \
+  --yaml sync-myproductions \
+  --parallel 3 \
+  --exclude "slow_backup" \
+  --continue-on-error \
+  --notify-summary
 ```
 
 ### Listing Jobs
@@ -382,7 +496,7 @@ t-pgsql supports three job formats: profile-based, connection string, and legacy
 
 #### Profile-Based Format (Recommended)
 
-Define reusable connection profiles to reduce repetition:
+Define reusable connection profiles and defaults to reduce repetition:
 
 ```yaml
 # Profiles - reusable connection configurations
@@ -402,7 +516,24 @@ profiles:
     db_host: localhost
     password_file: ~/.secrets/local.pass
 
-# Jobs using profiles
+# Defaults - inherited by all jobs
+defaults:
+  output: ~/data/dumps
+  from_keep: 1
+  force: true
+  compress: gzip
+  compress_level: 6
+  stream_buffer: 256
+  exclude_data: "audit.*,public.sessionlog"
+  parallel: 4
+  continue_on_error: true
+  notify:
+    telegram:
+      chat_id: "-123456789"
+      token: "BOT_TOKEN"
+      message_thread_id: 12345  # Optional: for forum topics
+
+# Jobs using profiles (inherit defaults)
 jobs:
   prod-to-local:
     command: clone
@@ -412,9 +543,7 @@ jobs:
     to:
       profile: local
       database: myapp_dev
-    force: true
-    from_keep: 1
-    exclude_data: "audit.*,logs"
+    # force, output, exclude_data etc. inherited from defaults
 ```
 
 #### Connection String Format
@@ -454,6 +583,136 @@ jobs:
 | `exclude_table` | Tables to exclude completely |
 | `exclude_data` | Tables to exclude data only (supports `schema.*` wildcard) |
 | `exclude_schema` | Schemas to exclude |
+
+---
+
+## Advanced Features
+
+### GFS Retention (Grandfather-Father-Son)
+
+Automated backup rotation policy that keeps daily, weekly, monthly, and yearly backups:
+
+```bash
+# Enable GFS retention with defaults (7 daily, 4 weekly, 12 monthly, 3 yearly)
+./t-pgsql dump \
+  --from "postgres@localhost/prod" \
+  --password-file .secrets/db.pass \
+  --retention
+
+# Custom retention periods
+./t-pgsql dump \
+  --from "postgres@localhost/prod" \
+  --password-file .secrets/db.pass \
+  --retention \
+  --retention-daily 14 \
+  --retention-weekly 8 \
+  --retention-monthly 24 \
+  --retention-yearly 5
+
+# In jobs.yaml
+jobs:
+  daily-backup:
+    command: dump
+    from: postgres@localhost/prod
+    from_password_file: .secrets/prod.pass
+    output: /backups
+    retention: true
+    retention_daily: 7
+    retention_weekly: 4
+```
+
+### Data Masking
+
+Anonymize sensitive data after restore for development/testing environments:
+
+```bash
+# Auto-mask common fields in specified tables
+./t-pgsql clone \
+  --from "ssh://user@prod/postgres@localhost/app" \
+  --to "postgres@localhost/dev" \
+  --mask \
+  --mask-tables "users,customers,orders" \
+  --force
+
+# Use custom masking rules file
+./t-pgsql clone \
+  --from "postgres@localhost/prod" \
+  --to "postgres@localhost/dev" \
+  --mask \
+  --mask-rules mask-rules.json \
+  --force
+```
+
+**mask-rules.json format:**
+
+```json
+{
+  "users.email": "CONCAT(LEFT(email, 2), '***@example.com')",
+  "users.phone": "'555-***-****'",
+  "users.name": "CONCAT('User_', id)",
+  "customers.address": "'[REDACTED]'",
+  "orders.notes": "NULL"
+}
+```
+
+**Auto-masked fields** (when using `--mask-tables`):
+- `email` → `ab***@***.com`
+- `phone` → `***-***-****`
+- `password` / `password_hash` → `********` / `MASKED`
+- `address` → `[MASKED]`
+- `ssn` → `***-**-****`
+- `credit_card` → `****-****-****-****`
+
+### Health Checks
+
+Verify database connections before operations:
+
+```bash
+# Enable health check (verify connection before operation)
+./t-pgsql clone \
+  --from "ssh://user@prod/postgres@localhost/app" \
+  --to "postgres@localhost/dev" \
+  --health-check \
+  --force
+
+# Abort if health check fails
+./t-pgsql clone \
+  --from "ssh://user@prod/postgres@localhost/app" \
+  --to "postgres@localhost/dev" \
+  --health-check \
+  --health-check-fail \
+  --force
+
+# Disable health checks
+./t-pgsql clone \
+  --from "postgres@localhost/prod" \
+  --to "postgres@localhost/dev" \
+  --no-health-check \
+  --force
+```
+
+### Streaming Mode
+
+Direct pipe transfer without creating temporary files (faster, less disk space):
+
+```bash
+# Stream clone (pg_dump | pg_restore)
+./t-pgsql clone \
+  --from "ssh://user@prod/postgres@localhost/app" \
+  --to "postgres@localhost/dev" \
+  --stream \
+  --force
+
+# With custom buffer size (requires pv installed)
+./t-pgsql clone \
+  --from "postgres@localhost/prod" \
+  --to "postgres@localhost/dev" \
+  --stream \
+  --stream-buffer 256 \
+  --force
+```
+
+> **Note:** Streaming mode doesn't create local dump files. Use regular clone if you need to keep backups.
 
 ---
 
